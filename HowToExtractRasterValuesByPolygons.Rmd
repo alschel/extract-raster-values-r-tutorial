@@ -1,0 +1,241 @@
+---
+title: "Extract raster values and find raster area by polygons"
+author: "Alexander Sheludkov"
+date: "31.01.2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+The last week I spent working with land-cover data from [GlobeLand30](http://www.globeland30.com) project. The dataset represented several raster layers with pixel values coding different land-cover classes. My aim was to calculate an area of croplands by municipal disticts and compare it to the official Rosstat data. I coded in **R**. However, since every raster layer had a resolution of 18.7 thousand by 13.6 thousand pixels (which is 256 million cells in total), the calculations took *hours*.
+Obviously, my laptop with modest 4GB of RAM and 1.3 GHz Intel Core i5 was too weak for such a work.
+So, I had to find more efficient way to solve the task.
+
+Here are some of my findings and observations. Hope, they would be helpful for someone. 
+In turn, [the materials of gis.stackexchange](https://gis.stackexchange.com/questions/130522/increasing-speed-of-crop-mask-extract-raster-by-many-polygons-in-r) were of a big help for me.
+
+## Task
+
+So, our task is to find an area of land of different classes by polygons.
+We will follow this algorithm. For each polygon: 
+
+* extract raster values 
+
+* find the number of cells of different classes
+
+* find a cell area and multiply by the number of cells.
+
+Packages we need:
+
+```{r libraries show not run, eval=FALSE}
+library(sp)
+library(raster)
+library(rgdal)
+require(velox)
+require(tidyverse) # for table data manupulation and visualization
+```
+```{r libraries run not show, include=FALSE}
+library(sp)
+library(raster)
+library(rgdal)
+require(velox)
+require(tidyverse) # for table data manupulation and visualization
+```
+
+
+
+## 1. Example data
+
+
+An example polygon layer represents [municipal borders of Tyumen province of Russia](data/myPolygons.Rdata), based on [OpenStreetMap](https://www.openstreetmap.org/) data.
+
+```{r load myPolygons}
+load("data/myPolygons.Rdata")
+```
+
+As for an example raster data, let's generate a RasterLayer with random values
+
+```{r generate raster data}
+set.seed(121)
+# Create an "empty" RasterLayer object with extent and projection of our Spatial* object -->
+r <- raster(ncol=1000, nrow=1000, 
+            ext = extent(myPolygons),
+            crs = crs(myPolygons))
+ncell(r) # number of cells
+```
+
+Assume, that we have 7 classes with 1-class as most rare and 7-class as mostly widespread.
+Assign random values to raster cells.
+```{r assign values to raster}
+values(r) <- sample(x = 1:7, 
+                    size = ncell(r), replace = T, 
+                    prob = seq(0.1, 0.7, 0.1))
+```
+Raster layer's values distribution
+```{r raster values distribution}
+values(r) %>% hist()
+```
+
+So, let's take a look of our example data
+```{r myPolygons plot}
+plot(r)
+plot(myPolygons, add = T)
+```
+
+
+
+## 2. Extracting raster values
+
+Basic packages for spatial data manipulation and analysis in R are sp and raster. 
+raster provides extract() and getValues() functions. We'll try both.
+
+
+
+### 2.1. raster::extract()
+
+```{r test1}
+system.time({
+  raster:: extract(x = r, y = myPolygons, na.rm = T, df = T) %>% # Extract the values into data.frame
+    group_by(ID, layer) %>%                                      # Group by spatial feature id and raster class 
+    summarise(n = n()) %>%                                       # For each sp feature calculate the number of cells of dif. classes
+    spread(layer, n) -> test1                                    # Reshape the table
+}) -> time1
+```
+
+Ok, the time we spent was:
+```{r test1 time}
+time1
+```
+
+And the resulting table:
+```{r test1 table}
+head(test1)
+```
+
+
+
+### 2.2. raster::crop() %>% raster::mask() %>% raster::getValues()
+
+This time we use getValues(). That means before extracting the values, we have to crop the RaslerLayer by polygons. We'll do it by two steps: 
+
+* crop() - returns raster clipped by Spatial* object's extent
+
+* mask() - returns raster, clipped by Spatial* object's contour
+
+```{r test2}
+system.time({
+  test2 <- data.frame()
+  for(i in 1:nrow(myPolygons)) {
+    single <- myPolygons[i, ]
+    clip1 <- crop(r, extent(single))
+    clip2 <- mask(clip1, single)
+    getValues(clip2) %>% table() %>% data.frame() %>% spread(., ., Freq) %>% mutate(id = i) -> tempTable
+    test2 <- bind_rows(test2, tempTable)
+  }
+}) -> time2
+```
+```{r test2 time}
+time2
+```
+```{r test2 table}
+head(test2)
+```
+
+The results almost the same. However, with larger rasters the second approach shows better results.
+
+Notice, while working with large objects, it is useful to put print(i) in the begining of the loop, which allows you to follow the progress, and Sys.sleep(1) to the end of the loop.
+
+
+
+### 2.3. velox::extract()
+
+Do we have any alternatives to raster? Yes, we do. The name of one is [velox](https://hunzikp.github.io/velox/). 
+velox has its own crop() (alternative to raster::mask()) and extract() methods.
+
+The package has some specific characteristics, which distinguish it from classic R syntax. 
+
+* To work with raster data we have to turn it to VeloxRaster object by velox()
+
+* very important: VeloxRaster objects are mutable 
+
+* all the manipulations with VeloxRaster are methods, which can be called through \$. This way: VeloxRaster$method
+
+Let's do it:
+```{r test3}
+vx <- velox(r) # this can take some time
+system.time({
+  vx$extract(sp = myPolygons, df = T) %>%
+    group_by(ID_sp, do.call..rbind...out.) %>% summarise(n = n()) %>%
+    spread(do.call..rbind...out., n) -> test3
+}) -> time3
+```
+```{r test3 time}
+time3
+```
+```{r test3 table}
+head(test3)
+```
+
+Wow. Don't know, how they do it, but that was much faster.
+
+```{r compare time, echo=FALSE}
+times <- rbind(cbind(rep("test1", 5), as.vector(time1), names(time1)),
+               cbind(rep("test2", 5), as.vector(time2), names(time2)),
+               cbind(rep("test3", 5), as.vector(time3), names(time3))) %>% 
+  data.frame(stringsAsFactors = F)
+times$X2 <- as.numeric(times$X2)
+
+times %>%
+  filter(X3 == "elapsed" | X3 == "sys.self" | X3 == "user.self") %>% 
+  ggplot(aes(x = X1, y = X2, fill = X3))+
+  geom_col(show.legend = F)+
+  scale_y_continuous(name = "Time")+
+  scale_x_discrete(name = element_blank())+
+  facet_grid(~X3)
+```
+
+In my case I revealed that cropping raster layer before extracting the values was the best strategy. 
+So, the final code was:
+
+```{r final code, eval=FALSE}
+vx <- velox(r)
+result <- data.frame()
+for(i in 1:nrow(myPolygons)) {
+  print(i)
+  single <- myPolygons[i, ]
+  vx_copy <- vx$copy()
+  vx_copy$crop(single)
+  vals <- vx_copy$extract(single, df = T)
+  # If polygon does not cover raster layer, extract() returns empty list, otherwise data.frame
+  if (is.data.frame(vals)) {
+    vals %>%
+      group_by(ID_sp, vals[,2]) %>% summarise(n = n()) %>%
+      spread('vals[, 2]', n) -> tempTable
+    tempTable <- cbind(single@data[1,1], tempTable[,-1])
+    result <- bind_rows(result, tempTable)
+  }
+  Sys.sleep(1)
+}
+```
+
+
+
+## 3. Calculating an area
+
+Cell area in hectares (ha)
+```{r cell area}
+cellArea <- res(r)[1] * res(r)[2] / 10000 
+```
+Some data format cleaning 
+```{r clean data format}
+test3$ID_sp <- as.character(test3$ID_sp) %>% as.integer(test3$ID_sp) # change data type
+test3 %>% arrange(ID_sp) -> test3                                    # fix the order
+```
+Final calculations
+```{r final calculations}
+cbind(name = myPolygons@data[,1], test3[2:8] * cellArea) -> result
+head(result)
+```
+
